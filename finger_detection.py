@@ -15,15 +15,15 @@ class FingerDetector:
             print("Download from: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task")
             raise FileNotFoundError(f"Model file not found: {model_path}")
         
-        # Initialize hand landmarker for video mode
+        # Initialize hand landmarker for video mode with higher confidence
         base_options = python.BaseOptions(model_asset_path=model_path)
         options = vision.HandLandmarkerOptions(
             base_options=base_options,
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_hand_detection_confidence=0.7,  # Increased for better accuracy
+            min_hand_presence_confidence=0.7,
+            min_tracking_confidence=0.7
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
         
@@ -33,13 +33,17 @@ class FingerDetector:
             base_options=base_options_image,
             running_mode=vision.RunningMode.IMAGE,
             num_hands=2,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_hand_detection_confidence=0.7,
+            min_hand_presence_confidence=0.7,
+            min_tracking_confidence=0.7
         )
         self.detector_image = vision.HandLandmarker.create_from_options(options_image)
         
         self.frame_timestamp_ms = 0
+        self.use_smoothing = True
+        # Smoothing buffer for finger counts (reduces jitter)
+        self.count_history = []
+        self.history_size = 5
         self.HAND_CONNECTIONS = [
             (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
             (0, 5), (5, 6), (6, 7), (7, 8),  # Index
@@ -49,14 +53,14 @@ class FingerDetector:
             (5, 9), (9, 13), (13, 17)  # Palm connections
         ]
         
-    def count_fingers(self, landmarks):
+    def count_fingers(self, landmarks, debug=False):
         """
-        Count the number of raised fingers with high accuracy.
-        Uses multiple checks: MCP joints and PIP joints for reliability.
+        Count the number of raised fingers with improved accuracy.
+        Uses distance-based checks for more reliable detection.
         Returns: count (int) - number of fingers raised
         """
         # MediaPipe hand landmarks (21 points per hand):
-        # Thumb: tip(4), IP(3), MCP(2)
+        # Thumb: tip(4), IP(3), MCP(2), CMC(1)
         # Index: tip(8), PIP(6), MCP(5)
         # Middle: tip(12), PIP(10), MCP(9)
         # Ring: tip(16), PIP(14), MCP(13)
@@ -64,52 +68,71 @@ class FingerDetector:
         # Wrist: 0
         
         fingers = []
+        finger_names = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+        wrist = landmarks[0]
         
-        # Thumb detection (special case - moves differently)
+        # Thumb detection - check if extended outward from hand
         thumb_tip = landmarks[4]
         thumb_ip = landmarks[3]
         thumb_mcp = landmarks[2]
-        wrist = landmarks[0]
+        index_mcp = landmarks[5]
         
-        # Calculate distances to determine thumb position
-        # Thumb is extended if tip is clearly away from hand
-        thumb_tip_to_ip_x = abs(thumb_tip.x - thumb_ip.x)
-        thumb_tip_to_ip_y = abs(thumb_tip.y - thumb_ip.y)
-        thumb_ip_to_mcp_x = abs(thumb_ip.x - thumb_mcp.x)
+        # Method 1: Check if thumb tip is to the right of thumb IP (for right hand)
+        # Method 2: Check distance from wrist
+        thumb_to_right = thumb_tip.x > thumb_ip.x + 0.02  # Thumb extended right
+        thumb_distance = ((thumb_tip.x - wrist.x)**2 + (thumb_tip.y - wrist.y)**2)**0.5
+        thumb_mcp_distance = ((thumb_mcp.x - wrist.x)**2 + (thumb_mcp.y - wrist.y)**2)**0.5
         
-        # Thumb is extended if:
-        # 1. Tip is significantly further from IP joint horizontally, OR
-        # 2. Tip is above IP joint (pointing up)
-        thumb_extended = (thumb_tip_to_ip_x > thumb_ip_to_mcp_x * 1.2) or \
-                        (thumb_tip.y < thumb_ip.y - 0.015)
+        # Thumb is extended if it's clearly to the side OR far from wrist
+        thumb_extended = thumb_to_right or (thumb_distance > thumb_mcp_distance * 1.15)
         fingers.append(1 if thumb_extended else 0)
         
-        # For other 4 fingers: Use both MCP and PIP checks for accuracy
-        # A finger is raised only if BOTH conditions are met:
-        # 1. Tip is above MCP joint (base of finger)
-        # 2. Tip is above PIP joint (middle joint) - ensures finger is truly extended
+        if debug:
+            print(f"Thumb: extended={thumb_extended}, to_right={thumb_to_right}, dist_ratio={thumb_distance/thumb_mcp_distance:.2f}")
         
-        # Index finger
-        index_tip_above_mcp = landmarks[8].y < landmarks[5].y
-        index_tip_above_pip = landmarks[8].y < landmarks[6].y
-        fingers.append(1 if (index_tip_above_mcp and index_tip_above_pip) else 0)
+        # For other 4 fingers: Check if tip is above MCP joint
+        # Use a threshold to prevent false positives from slightly bent fingers
         
-        # Middle finger
-        middle_tip_above_mcp = landmarks[12].y < landmarks[9].y
-        middle_tip_above_pip = landmarks[12].y < landmarks[10].y
-        fingers.append(1 if (middle_tip_above_mcp and middle_tip_above_pip) else 0)
+        finger_checks = [
+            (8, 5, 6),   # Index: tip, MCP, PIP
+            (12, 9, 10), # Middle: tip, MCP, PIP
+            (16, 13, 14), # Ring: tip, MCP, PIP
+            (20, 17, 18) # Pinky: tip, MCP, PIP
+        ]
         
-        # Ring finger
-        ring_tip_above_mcp = landmarks[16].y < landmarks[13].y
-        ring_tip_above_pip = landmarks[16].y < landmarks[14].y
-        fingers.append(1 if (ring_tip_above_mcp and ring_tip_above_pip) else 0)
+        for i, (tip_idx, mcp_idx, pip_idx) in enumerate(finger_checks):
+            tip = landmarks[tip_idx]
+            mcp = landmarks[mcp_idx]
+            pip = landmarks[pip_idx]
+            
+            # Check if tip is above MCP (finger is raised)
+            # Also verify tip is above PIP to ensure finger is extended, not just bent
+            tip_above_mcp = tip.y < mcp.y
+            tip_above_pip = tip.y < pip.y
+            
+            # Finger is raised if tip is above MCP AND tip is above PIP
+            # This ensures the finger is truly extended, not just bent at the base
+            finger_raised = tip_above_mcp and tip_above_pip
+            
+            fingers.append(1 if finger_raised else 0)
+            
+            if debug:
+                print(f"{finger_names[i+1]}: raised={finger_raised}, tip_y={tip.y:.3f}, mcp_y={mcp.y:.3f}, pip_y={pip.y:.3f}")
         
-        # Pinky finger
-        pinky_tip_above_mcp = landmarks[20].y < landmarks[17].y
-        pinky_tip_above_pip = landmarks[20].y < landmarks[18].y
-        fingers.append(1 if (pinky_tip_above_mcp and pinky_tip_above_pip) else 0)
+        total = sum(fingers)
         
-        return sum(fingers)
+        # Apply smoothing to reduce jitter
+        if self.use_smoothing:
+            self.count_history.append(total)
+            if len(self.count_history) > self.history_size:
+                self.count_history.pop(0)
+            # Return the most common value in recent history
+            from collections import Counter
+            if len(self.count_history) >= 3:
+                most_common = Counter(self.count_history).most_common(1)[0][0]
+                return most_common
+        
+        return total
     
     def draw_landmarks(self, image, landmarks):
         """Draw hand landmarks and connections on the image."""
@@ -231,6 +254,20 @@ class FingerDetector:
             # Display total finger count at top
             cv2.putText(frame, f'Total Fingers: {total_fingers}', (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            
+            # Display tips for better accuracy
+            cv2.putText(frame, "Tip: Keep hand steady, good lighting", (10, frame.shape[0] - 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            
+            # Display individual finger status (optional - for debugging)
+            finger_status = []
+            for i, hand_landmarks in enumerate(detection_result.hand_landmarks):
+                count = self.count_fingers(hand_landmarks, debug=False)
+                finger_status.append(f"Hand {i+1}: {count}")
+            
+            if len(finger_status) > 0:
+                cv2.putText(frame, " | ".join(finger_status), (10, 70),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
             # Display instructions
             cv2.putText(frame, "Press 'q' to quit", (10, frame.shape[0] - 20),
